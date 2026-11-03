@@ -1,0 +1,7 @@
+*.bak
+*.bak.*
+*.orig
+*.rej
+*~
+.env
+.env.*

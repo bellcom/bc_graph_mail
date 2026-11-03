@@ -1,0 +1,8 @@
+name = BC Graph Mail
+description = Sends Drupal 7 MIME mail using Microsoft Graph OAuth2 client credentials.
+package = Mail
+core = 7.x
+version = 7.x-1.0-beta1
+files[] = bc_graph_mail.mail.inc
+dependencies[] = mimemail
+dependencies[] = mailsystem

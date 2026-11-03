@@ -1,0 +1,151 @@
+<?php
+/**
+ * @file
+ * Microsoft Graph MIME transport for Drupal 7.
+ */
+
+/** Implements hook_menu(). */
+function bc_graph_mail_menu() {
+  $items['admin/config/system/bc-graph-mail'] = array(
+    'title' => 'BC Graph Mail',
+    'description' => 'Microsoft Graph mail settings and isolated test.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('bc_graph_mail_settings_form'),
+    'access arguments' => array('administer site configuration'),
+    'file' => 'bc_graph_mail.admin.inc',
+  );
+  return $items;
+}
+
+/** Implements hook_mailengine() (Mime Mail). */
+function bc_graph_mail_mailengine($op, $message = array()) {
+  switch ($op) {
+    case 'list':
+      return array('name' => t('BC Graph Mail'), 'description' => t('Microsoft Graph OAuth2 MIME transport.'));
+    case 'settings':
+      return array('info' => array('#markup' => l(t('Configure Graph Mail'), 'admin/config/system/bc-graph-mail')));
+    case 'multiple':
+    case 'single':
+    case 'send':
+      return bc_graph_mail_send($message);
+  }
+  return FALSE;
+}
+
+/** Safely get config: secret is NEVER kept in a Drupal variable. */
+function bc_graph_mail_config() {
+  $config = array();
+  if (!empty($GLOBALS['bc_graph_mail']) && is_array($GLOBALS['bc_graph_mail'])) {
+    $config = $GLOBALS['bc_graph_mail'];
+  }
+  return $config;
+}
+
+/** Simple CRLF injection check for any MIME header value. */
+function bc_graph_mail_clean_header($value) {
+  if (!is_scalar($value)) {
+    throw new Exception('Non-scalar mail header.');
+  }
+  $value = (string) $value;
+  if (preg_match('/[\r\n\x00]/', $value)) {
+    throw new Exception('Unsafe mail header.');
+  }
+  return $value;
+}
+
+/** Construct MIME exactly once; body is already built by Mime Mail. */
+function bc_graph_mail_mime(array $message, $recipient_override = NULL) {
+  $config = bc_graph_mail_config();
+  if (empty($config['sender']) || !valid_email_address($config['sender'])) {
+    throw new Exception('Graph sender mailbox is not configured.');
+  }
+  $to = $recipient_override !== NULL ? $recipient_override : (isset($message['to']) ? $message['to'] : '');
+  if (!is_string($to) || !$to || preg_match('/[\r\n\x00]/', $to)) {
+    throw new Exception('Invalid recipient.');
+  }
+  $headers = isset($message['headers']) && is_array($message['headers']) ? $message['headers'] : array();
+  $lines = array();
+  $lines[] = 'From: ' . bc_graph_mail_clean_header(!empty($config['sender_name']) ? $config['sender_name'] . ' <' . $config['sender'] . '>' : $config['sender']);
+  $lines[] = 'To: ' . bc_graph_mail_clean_header($to);
+  $lines[] = 'Subject: ' . bc_graph_mail_clean_header(isset($message['subject']) ? $message['subject'] : '');
+  $lines[] = 'Date: ' . gmdate('D, d M Y H:i:s +0000');
+  $lines[] = 'MIME-Version: 1.0';
+  $skip = array('from' => TRUE, 'to' => TRUE, 'subject' => TRUE, 'date' => TRUE, 'mime-version' => TRUE, 'return-path' => TRUE);
+  foreach ($headers as $key => $value) {
+    $key = (string) $key;
+    if (!preg_match('/^[A-Za-z0-9-]+$/', $key) || isset($skip[strtolower($key)])) {
+      continue;
+    }
+    if (is_array($value)) {
+      $value = implode(', ', $value);
+    }
+    $lines[] = $key . ': ' . bc_graph_mail_clean_header($value);
+  }
+  $body = isset($message['body']) ? $message['body'] : '';
+  if (!is_string($body)) {
+    throw new Exception('Mail body must be MIME-formatted before transport.');
+  }
+  return implode("\r\n", $lines) . "\r\n\r\n" . preg_replace('/\r?\n/', "\r\n", $body);
+}
+
+/** OAuth token fetch with Drupal cache. */
+function bc_graph_mail_token() {
+  $c = bc_graph_mail_config();
+  foreach (array('tenant_id', 'client_id', 'client_secret') as $key) {
+    if (empty($c[$key])) {
+      throw new Exception('Missing Graph configuration: ' . $key);
+    }
+  }
+  if (!preg_match('/^[0-9a-f-]{36}$/i', $c['tenant_id'])) {
+    throw new Exception('Invalid tenant ID.');
+  }
+  $cid = 'bc_graph_mail:token:' . hash('sha256', $c['tenant_id'] . '|' . $c['client_id']);
+  $cache = cache_get($cid, 'cache');
+  if ($cache && !empty($cache->data['token']) && $cache->expire > REQUEST_TIME + 120) {
+    return $cache->data['token'];
+  }
+  $url = 'https://login.microsoftonline.com/' . rawurlencode($c['tenant_id']) . '/oauth2/v2.0/token';
+  $response = drupal_http_request($url, array(
+    'method' => 'POST',
+    'headers' => array('Content-Type' => 'application/x-www-form-urlencoded'),
+    'data' => http_build_query(array('client_id' => $c['client_id'], 'client_secret' => $c['client_secret'], 'grant_type' => 'client_credentials', 'scope' => 'https://graph.microsoft.com/.default'), '', '&'),
+    'timeout' => 25,
+  ));
+  if (!isset($response->code) || (int) $response->code !== 200) {
+    throw new Exception('Token request failed (HTTP ' . (isset($response->code) ? $response->code : 'network') . ').');
+  }
+  $data = json_decode($response->data, TRUE);
+  if (empty($data['access_token']) || empty($data['expires_in'])) {
+    throw new Exception('Token response incomplete.');
+  }
+  $expiry = REQUEST_TIME + max(60, (int) $data['expires_in'] - 180);
+  cache_set($cid, array('token' => $data['access_token']), 'cache', $expiry);
+  return $data['access_token'];
+}
+
+/** Submit MIME; a 202 means accepted for processing, not delivered. */
+function bc_graph_mail_send(array $message, $recipient_override = NULL) {
+  try {
+    $c = bc_graph_mail_config();
+    $token = bc_graph_mail_token();
+    $mime = bc_graph_mail_mime($message, $recipient_override);
+    $url = 'https://graph.microsoft.com/v1.0/users/' . rawurlencode($c['sender']) . '/sendMail';
+    $response = drupal_http_request($url, array(
+      'method' => 'POST',
+      'headers' => array('Authorization' => 'Bearer ' . $token, 'Content-Type' => 'text/plain'),
+      'data' => base64_encode($mime),
+      'timeout' => 40,
+    ));
+    if (!isset($response->code) || (int) $response->code !== 202) {
+      $code = isset($response->code) ? $response->code : 'network';
+      $request_id = isset($response->headers['request-id']) ? $response->headers['request-id'] : '-';
+      throw new Exception('Graph sendMail failed: HTTP ' . $code . ', request-id ' . $request_id);
+    }
+    watchdog('bc_graph_mail', 'Microsoft Graph accepted message for @to (202).', array('@to' => $recipient_override !== NULL ? $recipient_override : $message['to']), WATCHDOG_NOTICE);
+    return TRUE;
+  }
+  catch (Exception $e) {
+    watchdog('bc_graph_mail', '@error', array('@error' => $e->getMessage()), WATCHDOG_ERROR);
+    return FALSE;
+  }
+}
