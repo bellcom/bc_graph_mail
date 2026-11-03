@@ -1,0 +1,13 @@
+{
+    "name": "bellcom/bc-graph-mail",
+    "description": "Microsoft Graph OAuth2 mail transport for Drupal 7",
+    "type": "drupal-module",
+    "license": "proprietary",
+    "require": {
+        "php": ">=7.4",
+        "composer/installers": "^1.12 || ^2.0"
+    },
+    "support": {
+        "source": "https://github.com/bellcom/bc_graph_mail"
+    }
+}
